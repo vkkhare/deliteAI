@@ -2,27 +2,31 @@
 #-*- coding: utf-8 -*-
 
 import json
-import datetime
-import torch
 import re
 import sys
 import os
-from typing import Tuple, List
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from typing import List
+from transformers import AutoConfig, AutoTokenizer
+import onnxruntime
+import numpy as np
+from huggingface_hub import hf_hub_download
 
 # Add parent directory to path to import tools
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import tools, tool_schema
 
 # Load Qwen3 1.7B 4-bit model and tokenizer
-model_id = "Qwen/Qwen3-1.7B"
+model_id = "onnx-community/Qwen3-1.7B-ONNX"
 
 TOOL_CALL_START_TOKEN = "<tool_call>"
 TOOL_CALL_END_TOKEN = "</tool_call>"
 TOOL_RESPONSE_START_TOKEN = "<tool_response>"
 TOOL_RESPONSE_END_TOKEN = "</tool_response>"
-INITIAL_PROMPT = f"""You are a helpful assistant. When you need to use tools, format your response with the tool call between {TOOL_CALL_START_TOKEN} and {TOOL_CALL_END_TOKEN} tokens.
-Use this format: {TOOL_CALL_START_TOKEN}[function_name(param="value")]{TOOL_CALL_END_TOKEN}. Call only one tool at a time and sequentially execute them."""
+INITIAL_PROMPT = f"""You are a helpful assistant with access to tools. When you need to use a tool, format your response with JSON between {TOOL_CALL_START_TOKEN} and {TOOL_CALL_END_TOKEN} tokens.
+
+Use this exact format: {TOOL_CALL_START_TOKEN}{{"name": "function_name", "arguments": {{"param": "value"}}}}{TOOL_CALL_END_TOKEN}
+If a tool requires a argument you don't know the value of check if another tool can give you that information and call that tool first.
+Always respond directly and call the appropriate tool when needed."""
 
 initial_message_block = [
     {
@@ -31,27 +35,12 @@ initial_message_block = [
     }
 ]
 
-# from mlx_lm import load, generate
-
-# model, tokenizer = load("mlx-community/Qwen3-1.7B-4bit")
-from transformers.utils.quantization_config import BitsAndBytesConfig
-
-# Configure 4-bit quantization
-quantization_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4"
-)
-
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    device_map="auto",
-    torch_dtype=torch.bfloat16,
-    quantization_config=quantization_config,
-    trust_remote_code=True,
-)
-tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+config = AutoConfig.from_pretrained(model_id)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+filename = "model_q4f16.onnx" # Options: model.onnx
+model_path = hf_hub_download(repo_id=model_id, filename=f"onnx/{filename}") # Download the graph
+# hf_hub_download(repo_id=model_id, filename=f"onnx/{filename}_data") # Download the weights
+session = onnxruntime.InferenceSession(model_path)
 
 # Ensure tokenizer has necessary tokens
 if tokenizer.pad_token is None:
@@ -108,6 +97,7 @@ def parse_tool_calls_from_response(response_text: str) -> list:
     
     return tool_calls
 
+
 def generate_with_model(conversation_messages: List, max_new_tokens: int = 150) -> str:
     """Generate text using the loaded model with multi-turn conversation support"""
     # Use chat template with tools for multi-turn conversations
@@ -115,32 +105,81 @@ def generate_with_model(conversation_messages: List, max_new_tokens: int = 150) 
     print("Conversation Messages:")
     print(json.dumps(conversation_messages, indent=4))
     print("---"*10)
-    prompt = tokenizer.apply_chat_template(
-        conversation_messages,
-        tools=tool_schema,
-        add_generation_prompt=True,
-        tokenize=False
+
+    # 2. Prepare inputs
+    inputs = tokenizer.apply_chat_template(
+      conversation_messages,
+      tools=tool_schema,
+      add_generation_prompt=True,
+      tokenize=True,
+      return_dict=True,
+      return_tensors="np"
     )
+    input_ids = inputs['input_ids']
+    attention_mask = inputs['attention_mask']
+    batch_size = input_ids.shape[0]
+    position_ids = np.tile(np.arange(0, input_ids.shape[-1]), (batch_size, 1))
+
+    # Set config values
+    num_key_value_heads = config.num_key_value_heads
+    head_dim = config.hidden_size // config.num_attention_heads
+    num_hidden_layers = config.num_hidden_layers
+    eos_token_id = config.eos_token_id
+    hidden_size = config.hidden_size
+    # Initialize past cache values with correct shapes for ONNX model
+    past_cache_values = {}
     
-    # response = generate(model, tokenizer, prompt)
-    # Tokenize the prompt
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-    
-    # Generate response with parameters optimized for tool calling
-    with torch.no_grad():
-        output = model.generate(
-            input_ids,
-            # do_sample=True,
-            temperature=0.3,  # Good balance for Qwen3
-            # top_p=0.8,        # Nucleus sampling for focused responses
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            repetition_penalty=1.1,  # Prevent repetition
-        )
-    
-    response = tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True)
+    # Check if config has layer_types (like LFM2)
+    if hasattr(config, 'layer_types'):
+        for i in range(num_hidden_layers):
+            if config.layer_types[i] == 'full_attention':
+                for kv in ('key', 'value'):
+                    # Use the ONNX model's expected head count (8) from the input shapes
+                    past_cache_values[f'past_key_values.{i}.{kv}'] = np.zeros([batch_size, 8, 0, head_dim], dtype=np.float16)
+            elif config.layer_types[i] == 'conv':
+                past_cache_values[f'past_conv.{i}'] = np.zeros([batch_size, hidden_size, config.conv_L_cache], dtype=np.float16)
+    else:
+        # Standard transformer layers - use ONNX model's expected head count (8)
+        for i in range(num_hidden_layers):
+            for kv in ('key', 'value'):
+                # Use 8 heads as expected by the ONNX model (from debug output)
+                past_cache_values[f'past_key_values.{i}.{kv}'] = np.zeros([batch_size, 8, 0, head_dim], dtype=np.float16)
+
+    # 3. Generation loop
+    generated_tokens = []
+    for i in range(max_new_tokens):
+        logits, *present_cache_values = session.run(None, dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            **past_cache_values,
+        ))
+
+        # Update values for next generation loop
+        logits_array = np.asarray(logits)
+        next_token_id = np.argmax(logits_array[0, -1, :])
+        
+        # Check for EOS token
+        if next_token_id == eos_token_id:
+            break
+            
+        generated_tokens.append(next_token_id)
+        input_ids = np.array([[next_token_id]], dtype=np.int64)
+        attention_mask = np.concatenate([attention_mask, np.ones_like(input_ids, dtype=np.int64)], axis=-1)
+        position_ids = position_ids[:, -1:] + 1
+        
+        # Update cache
+        for j, key in enumerate(past_cache_values):
+            past_cache_values[key] = present_cache_values[j]
+
+    # 4. Output result - decode only the generated tokens
+    if generated_tokens:
+        generated_tokens_array = np.array([generated_tokens], dtype=np.int64)
+        response = tokenizer.batch_decode(generated_tokens_array, skip_special_tokens=True)[0]
+    else:
+        response = ""
     return response.strip()
+
 
 def handle_multi_step_request(user_prompt: str, max_steps: int, max_new_tokens: int) -> list:
     """Handle requests that may require multiple tool calls and back and forth"""

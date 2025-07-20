@@ -2,27 +2,29 @@
 #-*- coding: utf-8 -*-
 
 import json
-import datetime
-import torch
 import re
 import sys
 import os
-from typing import Tuple, List
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from typing import List
 
 # Add parent directory to path to import tools
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import tools, tool_schema
 
-# Load Qwen3 1.7B 4-bit model and tokenizer
-model_id = "Qwen/Qwen3-1.7B"
+from transformers import AutoConfig, AutoTokenizer
+import onnxruntime
+import numpy as np
+from huggingface_hub import hf_hub_download
 
-TOOL_CALL_START_TOKEN = "<tool_call>"
-TOOL_CALL_END_TOKEN = "</tool_call>"
-TOOL_RESPONSE_START_TOKEN = "<tool_response>"
-TOOL_RESPONSE_END_TOKEN = "</tool_response>"
-INITIAL_PROMPT = f"""You are a helpful assistant. When you need to use tools, format your response with the tool call between {TOOL_CALL_START_TOKEN} and {TOOL_CALL_END_TOKEN} tokens.
-Use this format: {TOOL_CALL_START_TOKEN}[function_name(param="value")]{TOOL_CALL_END_TOKEN}. Call only one tool at a time and sequentially execute them."""
+# 1. Load config, processor, and model
+model_id = "onnx-community/LFM2-1.2B-ONNX"
+
+
+TOOL_CALL_START_TOKEN = "<|tool_call_start|>"
+TOOL_CALL_END_TOKEN = "<|tool_call_end|>"
+TOOL_RESPONSE_START_TOKEN = "<|tool_response_start|>"
+TOOL_RESPONSE_END_TOKEN = "<|tool_response_end|>"
+INITIAL_PROMPT = f"""You are a helpful assistant. When you need to use tools, call only one tool at a time and sequentially execute them."""
 
 initial_message_block = [
     {
@@ -31,34 +33,21 @@ initial_message_block = [
     }
 ]
 
-# from mlx_lm import load, generate
+config = AutoConfig.from_pretrained(model_id)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+filename = "model.onnx" # Options: "model.onnx", "model_fp16.onnx", "model_q4.onnx", "model_q4f16.onnx"
+model_path = hf_hub_download(repo_id=model_id, filename=f"onnx/{filename}") # Download the graph
+hf_hub_download(repo_id=model_id, filename=f"onnx/{filename}_data") # Download the weights
+session = onnxruntime.InferenceSession(model_path)
 
-# model, tokenizer = load("mlx-community/Qwen3-1.7B-4bit")
-from transformers.utils.quantization_config import BitsAndBytesConfig
-
-# Configure 4-bit quantization
-quantization_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4"
-)
-
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    device_map="auto",
-    torch_dtype=torch.bfloat16,
-    quantization_config=quantization_config,
-    trust_remote_code=True,
-)
-tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-
-# Ensure tokenizer has necessary tokens
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-    
-print(f"✓ {model_id} model loaded successfully!")
-
+## Set config values
+num_key_value_heads = config.num_key_value_heads
+head_dim = config.hidden_size // config.num_attention_heads
+num_hidden_layers = config.num_hidden_layers
+eos_token_id = config.eos_token_id
+hidden_size = config.hidden_size
+conv_L_cache = config.conv_L_cache
+layer_types = config.layer_types
 
 def execute_function_call(function_name: str, arguments: dict) -> dict:
     """Execute a function call and return the result"""
@@ -75,7 +64,7 @@ def execute_function_call(function_name: str, arguments: dict) -> dict:
 def format_tool_response(result: dict) -> str:
     """Format tool execution result using token-based format"""
     result_json = json.dumps(result)
-    return f"<|tool_response_start|>{result_json}<|tool_response_end|>"
+    return f"{TOOL_RESPONSE_START_TOKEN}{result_json}{TOOL_RESPONSE_END_TOKEN}"
 
 def execute_tool_call_with_response(function_name: str, arguments: dict) -> tuple:
     """Execute a function call and return both result and formatted response"""
@@ -87,8 +76,8 @@ def parse_tool_calls_from_response(response_text: str) -> list:
     """Parse tool calls from model response using multiple formats"""
     tool_calls = []
 
-    # Method 2: Look for JSON-style tool calls: <tool_call>{"name": "func", "arguments": {...}}</tool_call>
-    json_tool_pattern = r'<tool_call>\s*({.*?})\s*</tool_call>'
+    # Method 2: Look for JSON-style tool calls: <|tool_call_start|>{"name": "func", "arguments": {...}}<|tool_call_end|>
+    json_tool_pattern = r'<\|tool_call_start\|>\s*({.*?})\s*<\|tool_call_end\|>'
     json_matches = re.findall(json_tool_pattern, response_text, re.DOTALL)
     
     for json_str in json_matches:
@@ -115,37 +104,58 @@ def generate_with_model(conversation_messages: List, max_new_tokens: int = 150) 
     print("Conversation Messages:")
     print(json.dumps(conversation_messages, indent=4))
     print("---"*10)
-    prompt = tokenizer.apply_chat_template(
-        conversation_messages,
-        tools=tool_schema,
-        add_generation_prompt=True,
-        tokenize=False
+
+    # 2. Prepare inputs
+    inputs = tokenizer.apply_chat_template(
+      conversation_messages,
+      tools=tool_schema,
+      add_generation_prompt=True,
+      tokenize=True,
+      return_dict=True,
+      return_tensors="np"
     )
-    
-    # response = generate(model, tokenizer, prompt)
-    # Tokenize the prompt
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-    
-    # Generate response with parameters optimized for tool calling
-    with torch.no_grad():
-        output = model.generate(
-            input_ids,
-            # do_sample=True,
-            temperature=0.3,  # Good balance for Qwen3
-            # top_p=0.8,        # Nucleus sampling for focused responses
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            repetition_penalty=1.1,  # Prevent repetition
-        )
-    
-    response = tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True)
+    input_ids = inputs['input_ids']
+    attention_mask = inputs['attention_mask']
+    batch_size = input_ids.shape[0]
+    position_ids = np.tile(np.arange(0, input_ids.shape[-1]), (batch_size, 1))
+    past_cache_values = {}
+    for i in range(num_hidden_layers):
+      if layer_types[i] == 'full_attention':
+        for kv in ('key', 'value'):
+          past_cache_values[f'past_key_values.{i}.{kv}'] = np.zeros([batch_size, num_key_value_heads, 0, head_dim], dtype=np.float32)
+      elif layer_types[i] == 'conv':
+        past_cache_values[f'past_conv.{i}'] = np.zeros([batch_size, hidden_size, conv_L_cache], dtype=np.float32)
+      else:
+        raise ValueError(f"Unsupported layer type: {layer_types[i]}")
+
+    # 3. Generation loop
+    generated_tokens = np.array([[]], dtype=np.int64)
+    for i in range(max_new_tokens):
+      logits, *present_cache_values = session.run(None, dict(
+          input_ids=input_ids,
+          attention_mask=attention_mask,
+          position_ids=position_ids,
+          **past_cache_values,
+      ))
+
+      ## Update values for next generation loop
+      input_ids = logits[:, -1].argmax(-1, keepdims=True)
+      attention_mask = np.concatenate([attention_mask, np.ones_like(input_ids, dtype=np.int64)], axis=-1)
+      position_ids = position_ids[:, -1:] + 1
+      for j, key in enumerate(past_cache_values):
+        past_cache_values[key] = present_cache_values[j]
+      generated_tokens = np.concatenate([generated_tokens, input_ids], axis=-1)
+      if (input_ids == eos_token_id).all():
+        break
+
+    # 4. Output result
+    response = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
     return response.strip()
 
 def handle_multi_step_request(user_prompt: str, max_steps: int, max_new_tokens: int) -> list:
     """Handle requests that may require multiple tool calls and back and forth"""
     step_results = []
-    conversation_messages: List[dict] = []  # Initialize as empty list, not None
+    conversation_messages : List[dict] = []  # Will hold the full conversation chain
     tool_context = {}  # Store results from previous tool calls
     
     for step in range(max_steps):
